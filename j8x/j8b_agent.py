@@ -11,6 +11,7 @@ Ortam:
   STATE_FILE    ./.home.json (uuid + mqtt kimliği)  — add-on'da /data/home.json
   INSTALL_TYPE  os | container | core | dev
 İlke: config gelmeden hiçbir state yayınlanmaz; yalnız expose listesindekiler çıkar; attributes'tan kayıt defterinde olanlar atılır.
+0.2.1 (M8): eylem {notify:"metin"} → event/notify (bulut bildirime çevirir)
 0.2.0 (M7): config.automations[] → EVDE çalışan kural motoru (tetik: to|above|below + for_sec; koşul: saat/gün/durum; eylem: call_service);
             cmd {actions:[…]} → sahne (sırayla uygula, tek ack); event/automation → bulutta çalışma kaydı.
 """
@@ -23,7 +24,7 @@ except Exception:  # pragma: no cover
 import aiohttp
 import paho.mqtt.client as mqtt
 
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.2.1"
 log = logging.getLogger("j8b")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 
@@ -247,7 +248,11 @@ class Agent:
         """Sahne/otomasyon eylemleri sırayla; hatalar toplanır, kalanlar yine denenir. Döner: hata listesi."""
         errs = []
         for a in actions:
-            try: await self.call_action(a)
+            try:
+                if "notify" in a:                                   # M8: bildirim eylemi → bulut (event/notify) → e-posta/push
+                    self.pub("event/notify", {"message": str(a["notify"])[:200], "automation_id": a.get("_rid"), "name": a.get("_rname"), "ts": int(time.time())}, 1, False)
+                    continue
+                await self.call_action(a)
             except Exception as e: errs.append(a.get("entity_id", "?") + ": " + str(e)[:80])
         return errs
 
@@ -313,7 +318,7 @@ class Agent:
             if not self.conditions_ok(r): log.info("otomasyon %s: koşul tutmadı", r.get("name")); return
             if time.time() - self.rule_last.get(rid, 0) < 2: return  # sektirme
             self.rule_last[rid] = time.time()
-            errs = await self.run_actions(r["actions"])
+            errs = await self.run_actions([dict(a, _rid=rid, _rname=r.get("name")) if "notify" in a else a for a in r["actions"]])
             self.pub("event/automation", {"id": rid, "name": r.get("name"), "ok": not errs, "error": "; ".join(errs)[:200] or None, "ts": int(time.time())}, 1, False)
             log.info("otomasyon %s → %s %s", r.get("name"), "ok" if not errs else "HATA", "; ".join(errs))
         except asyncio.CancelledError:

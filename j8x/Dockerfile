@@ -5,7 +5,7 @@ FROM ghcr.io/home-assistant/${BUILD_ARCH}-base-python:3.12-alpine3.22
 ARG BUILD_ARCH
 ARG BUILD_VERSION=dev
 # paho-mqtt + aiohttp: aarch64/amd64 musl icin hazir wheel var (PyPI'da dogrulandi 2026-11-16); derleme yok
-RUN pip3 install --no-cache-dir "paho-mqtt>=2,<3" "aiohttp>=3.9,<4"
+RUN pip3 install --no-cache-dir "paho-mqtt>=2,<3" "aiohttp>=3.9,<4" tzdata
 COPY j8b_agent.py /app/j8b_agent.py
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh

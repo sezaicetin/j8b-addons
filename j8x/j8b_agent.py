@@ -11,12 +11,19 @@ Ortam:
   STATE_FILE    ./.home.json (uuid + mqtt kimliği)  — add-on'da /data/home.json
   INSTALL_TYPE  os | container | core | dev
 İlke: config gelmeden hiçbir state yayınlanmaz; yalnız expose listesindekiler çıkar; attributes'tan kayıt defterinde olanlar atılır.
+0.2.0 (M7): config.automations[] → EVDE çalışan kural motoru (tetik: to|above|below + for_sec; koşul: saat/gün/durum; eylem: call_service);
+            cmd {actions:[…]} → sahne (sırayla uygula, tek ack); event/automation → bulutta çalışma kaydı.
 """
 import asyncio, json, os, sys, time, signal, ssl, logging
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 import aiohttp
 import paho.mqtt.client as mqtt
 
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.2.0"
 log = logging.getLogger("j8b")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 
@@ -121,6 +128,7 @@ class Agent:
     def __init__(self, st):
         self.st = st; self.uuid = st["uuid"]; self.root = "j8b/" + self.uuid
         self.expose = set(); self.expose_all = False; self.config_seen = False
+        self.rules = []; self.rule_tasks = {}; self.rule_last = {}; self._states = {}; self.tz = None      # M7 kural motoru; tz = HA'nın saat dilimi
         self.registry = {}; self.iot_cache = {}; self.ha = None; self.ha_version = ""
         self.loop = None; self.q = asyncio.Queue()
         m = st["mqtt"]
@@ -222,28 +230,114 @@ class Agent:
         self.config_seen = True
         for eid in old - self.expose:                      # artık açık olmayanın retained state'i temizlenir
             if not self.expose_all: self.mq.publish(self.root + "/state/" + eid, b"", qos=0, retain=True)
-        log.info("Config alındı: %d entity açık (expose_all=%s)", len(self.expose), self.expose_all)
+        self.rules = [r for r in (cfg.get("automations") or []) if isinstance(r, dict) and r.get("trigger") and r.get("actions")]
+        for t in self.rule_tasks.values(): t.cancel()
+        self.rule_tasks = {}
+        log.info("Config alındı: %d entity açık (expose_all=%s), %d otomasyon", len(self.expose), self.expose_all, len(self.rules))
         self.publish_all_exposed()
+
+    async def call_action(self, a):
+        """Tek eylem {entity_id, service, data}: yalnız açığa çıkarılmış entity; domain entity_id'den türetilir."""
+        eid = a["entity_id"]; domain = eid.split(".", 1)[0]
+        if not self.exposed(eid): raise PermissionError("entity açığa çıkarılmamış: " + eid)
+        if a.get("domain") and a["domain"] != domain: raise ValueError("domain uyuşmuyor")
+        await self.ha.call({"type": "call_service", "domain": domain, "service": a["service"], "service_data": a.get("data") or {}, "target": {"entity_id": eid}})
+
+    async def run_actions(self, actions):
+        """Sahne/otomasyon eylemleri sırayla; hatalar toplanır, kalanlar yine denenir. Döner: hata listesi."""
+        errs = []
+        for a in actions:
+            try: await self.call_action(a)
+            except Exception as e: errs.append(a.get("entity_id", "?") + ": " + str(e)[:80])
+        return errs
 
     async def handle_cmd(self, topic, payload):
         rid = topic.rsplit("/", 1)[-1]; ok = False; err = None
         try:
-            c = json.loads(payload); eid = c["entity_id"]
-            if not self.exposed(eid): raise PermissionError("entity açığa çıkarılmamış")
-            if eid.split(".", 1)[0] != c["domain"]: raise ValueError("domain uyuşmuyor")
-            await self.ha.call({"type": "call_service", "domain": c["domain"], "service": c["service"], "service_data": c.get("data") or {}, "target": {"entity_id": eid}})
-            ok = True
+            c = json.loads(payload)
+            if isinstance(c.get("actions"), list):                 # M7: sahne — çoklu eylem, tek ack
+                errs = await self.run_actions(c["actions"]); ok = not errs; err = "; ".join(errs)[:200] or None
+            else:
+                await self.call_action(c); ok = True
         except Exception as e:
             err = str(e)[:200]
         self.pub("ack/" + rid, {"ok": ok, "error": err, "ts": int(time.time())}, 1, False)
         log.info("cmd %s → %s %s", rid[:8], "ok" if ok else "HATA", err or "")
 
+    # --- M7 kural motoru (evde çalışır; bulut yalnız tanımı gönderir)
+    def _num(self, v):
+        try: return float(v)
+        except Exception: return None
+
+    def rule_fires(self, r, old, new):
+        """Tetik eşleşti mi? to: durum tam o değere DEĞİŞTİ; above/below: eşik GEÇİLDİ (eski diğer tarafta)."""
+        t = r["trigger"]; os_ = old.get("state") if old else None; ns = new.get("state")
+        if "to" in t:
+            if ns != t["to"] or os_ == ns: return False
+            if t.get("from") and os_ != t["from"]: return False
+            return True
+        n = self._num(ns); o = self._num(os_)
+        if n is None: return False
+        if "above" in t: return n > float(t["above"]) and (o is None or o <= float(t["above"]))
+        if "below" in t: return n < float(t["below"]) and (o is None or o >= float(t["below"]))
+        return False
+
+    def conditions_ok(self, r):
+        c = r.get("conditions") or {}
+        if not isinstance(c, dict): return True
+        now = datetime.now(self.tz) if self.tz else datetime.now()
+        hm = now.strftime("%H:%M"); dow = now.isoweekday()   # Pzt=1
+        a, b = c.get("after"), c.get("before")
+        if a and b:
+            inside = (a <= hm < b) if a <= b else (hm >= a or hm < b)      # gece yarısını aşan aralık (18:00-06:00)
+            if not inside: return False
+        elif a and hm < a: return False
+        elif b and hm >= b: return False
+        if c.get("days") and dow not in c["days"]: return False
+        for sc in c.get("states") or []:
+            st = self._states.get(sc.get("entity_id"))
+            if not st or str(st.get("state")) != str(sc.get("state")): return False
+        return True
+
+    async def fire_rule(self, r, delay=0):
+        rid = r.get("id"); t = r["trigger"]
+        try:
+            if delay:
+                await asyncio.sleep(delay)
+                cur = self._states.get(t["entity_id"])               # süre dolunca hâlâ tetik durumunda mı?
+                if not cur: return
+                if "to" in t and cur.get("state") != t["to"]: return
+                n = self._num(cur.get("state"))
+                if "above" in t and (n is None or n <= float(t["above"])): return
+                if "below" in t and (n is None or n >= float(t["below"])): return
+            if not self.conditions_ok(r): log.info("otomasyon %s: koşul tutmadı", r.get("name")); return
+            if time.time() - self.rule_last.get(rid, 0) < 2: return  # sektirme
+            self.rule_last[rid] = time.time()
+            errs = await self.run_actions(r["actions"])
+            self.pub("event/automation", {"id": rid, "name": r.get("name"), "ok": not errs, "error": "; ".join(errs)[:200] or None, "ts": int(time.time())}, 1, False)
+            log.info("otomasyon %s → %s %s", r.get("name"), "ok" if not errs else "HATA", "; ".join(errs))
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.rule_tasks.pop(rid, None)
+
+    def eval_rules(self, eid, old, new):
+        for r in self.rules:
+            t = r["trigger"]
+            if t.get("entity_id") != eid: continue
+            if self.rule_fires(r, old, new):
+                if r.get("id") in self.rule_tasks: continue
+                self.rule_tasks[r.get("id")] = asyncio.ensure_future(self.fire_rule(r, int(t.get("for_sec") or 0)))
+            elif "to" in t and new.get("state") != t["to"] and r.get("id") in self.rule_tasks:
+                self.rule_tasks[r.get("id")].cancel()                 # bekleme sırasında durum bozuldu → iptal
+
     async def on_ha_event(self, ev):
         if ev.get("event_type") != "state_changed": return
-        d = ev.get("data", {}); eid = d.get("entity_id"); new = d.get("new_state")
+        d = ev.get("data", {}); eid = d.get("entity_id"); new = d.get("new_state"); old = d.get("old_state") or self._states.get(eid)
         if new is None: return
         self._states[eid] = new
         if self.exposed(eid): self.publish_state(eid, new)
+        if self.rules: self.eval_rules(eid, old, new)
 
     # --- ana döngü
     async def run(self):
@@ -255,6 +349,12 @@ class Agent:
             m = self.st["mqtt"]
             self.mq.connect_async(m["host"], int(m["port"]), keepalive=60); self.mq.loop_start()
             await self.ha.call({"type": "subscribe_events", "event_type": "state_changed"})
+            try:                                                   # HA'nın saat dilimi → otomasyon saat koşulları
+                cfg = await self.ha.call({"type": "get_config"}); tzname = (cfg or {}).get("time_zone") or ""
+                self.tz = ZoneInfo(tzname) if (tzname and ZoneInfo) else None
+                log.info("Saat dilimi: %s", tzname or "sistem")
+            except Exception as e:
+                log.warning("Saat dilimi alınamadı (%s); sistem saati kullanılacak", e)
             last_status = 0
             while True:
                 try:

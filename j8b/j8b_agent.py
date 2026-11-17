@@ -11,6 +11,7 @@ Ortam:
   STATE_FILE    ./.home.json (uuid + mqtt kimliği)  — add-on'da /data/home.json
   INSTALL_TYPE  os | container | core | dev
 İlke: config gelmeden hiçbir state yayınlanmaz; yalnız expose listesindekiler çıkar; attributes'tan kayıt defterinde olanlar atılır.
+0.4.0: j8b.weather sanal cihazı — HA koordinatlarıyla Open-Meteo anlık hava (15 dk), kartta + otomasyon tetiğinde; bulut yükü yok
 0.2.1 (M8): eylem {notify:"metin"} → event/notify (bulut bildirime çevirir)
 0.2.0 (M7): config.automations[] → EVDE çalışan kural motoru (tetik: to|above|below + for_sec; koşul: saat/gün/durum; eylem: call_service);
             cmd {actions:[…]} → sahne (sırayla uygula, tek ack); event/automation → bulutta çalışma kaydı.
@@ -24,7 +25,7 @@ except Exception:  # pragma: no cover
 import aiohttp
 import paho.mqtt.client as mqtt
 
-AGENT_VERSION = "0.3.1"
+AGENT_VERSION = "0.4.0"
 log = logging.getLogger("j8b")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 
@@ -125,11 +126,28 @@ class HA:
 
 
 # ---------------------------------------------------------------- ajan
+WEATHER_EID = "weather.j8b_hava"
+# WMO weather_code → HA weather durumu (kart ve kurallar HA sözlüğünü kullanır)
+def wmo_to_state(code, is_day):
+    code = int(code or 0)
+    if code == 0: return "sunny" if is_day else "clear-night"
+    if code in (1, 2): return "partlycloudy"
+    if code == 3: return "cloudy"
+    if code in (45, 48): return "fog"
+    if code in (51, 53, 55, 56, 57, 61, 63, 80, 81): return "rainy"
+    if code in (65, 82): return "pouring"
+    if code in (66, 67): return "snowy-rainy"
+    if code in (71, 73, 75, 77, 85, 86): return "snowy"
+    if code in (95,): return "lightning"
+    if code in (96, 99): return "lightning-rainy"
+    return "exceptional"
+
 class Agent:
     def __init__(self, st):
         self.st = st; self.uuid = st["uuid"]; self.root = "j8b/" + self.uuid
         self.expose = set(); self.expose_all = False; self.config_seen = False
         self.rules = []; self.rule_tasks = {}; self.rule_last = {}; self._states = {}; self.tz = None      # M7 kural motoru; tz = HA'nın saat dilimi
+        self.lat = None; self.lon = None; self.weather_task = None                                       # 0.4.0 hava (Open-Meteo)
         self.registry = {}; self.iot_cache = {}; self.ha = None; self.ha_version = ""
         self.loop = None; self.q = asyncio.Queue()
         m = st["mqtt"]
@@ -205,6 +223,12 @@ class Agent:
             item = {"entity_id": eid, "domain": eid.split(".", 1)[0], "device_class": attr.get("device_class", ""), "name": attr.get("friendly_name", eid), "device_id": "", "area_id": "",
                     "unit": attr.get("unit_of_measurement", ""), "supported_features": int(attr.get("supported_features") or 0), "icon": attr.get("icon", ""), "disabled": False, "hidden": False}
             out_ent.append(item); self.registry[eid] = item
+        # 0.4.0: j8b sanal hava cihazı (HA koordinatları varsa). Varsayılan açığa çıkmış sayılmaz; kullanıcı Cihazlar'dan işaretler (hava özel veri değildir ama kural aynı).
+        if self.lat is not None:
+            out_dev.append({"device_id": "j8b_cloudless", "name": "j8b Hava", "manufacturer": "j8b", "model": "Open-Meteo", "area_id": "", "integration": "j8b", "iot_class": "cloud_polling", "sw_version": AGENT_VERSION})
+            item = {"entity_id": WEATHER_EID, "domain": "weather", "device_class": "", "name": "Hava (j8b)", "device_id": "j8b_cloudless", "area_id": "", "unit": "", "supported_features": 0, "icon": "", "disabled": False, "hidden": False}
+            out_ent.append(item); self.registry[WEATHER_EID] = item
+            if WEATHER_EID in self._states: states[WEATHER_EID] = self._states[WEATHER_EID]
         payload = {"areas": [{"area_id": a["area_id"], "name": a.get("name", ""), "icon": a.get("icon") or ""} for a in areas], "devices": out_dev, "entities": out_ent, "ts": int(time.time())}
         self.pub("registry", payload, 1, True)
         log.info("Kayıt defteri yayınlandı: %d alan, %d cihaz, %d entity", len(areas), len(out_dev), len(out_ent))
@@ -336,6 +360,31 @@ class Agent:
             elif "to" in t and new.get("state") != t["to"] and r.get("id") in self.rule_tasks:
                 self.rule_tasks[r.get("id")].cancel()                 # bekleme sırasında durum bozuldu → iptal
 
+    # --- 0.4.0 hava: Open-Meteo anlık + 3 günlük tahmin, 15 dk'da bir; HA state_changed gibi işlenir (kart, geçmiş, kurallar)
+    async def weather_loop(self, session):
+        url = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,rain,weather_code,wind_speed_10m,is_day"
+               "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=4&timezone=auto") % (self.lat, self.lon)
+        while True:
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    d = await r.json()
+                cur = d.get("current") or {}; daily = d.get("daily") or {}
+                state = wmo_to_state(cur.get("weather_code"), cur.get("is_day", 1))
+                fc = [{"datetime": daily["time"][i], "condition": wmo_to_state(daily["weather_code"][i], 1), "temperature": daily["temperature_2m_max"][i], "templow": daily["temperature_2m_min"][i], "precipitation_probability": (daily.get("precipitation_probability_max") or [None]*9)[i]} for i in range(min(4, len(daily.get("time") or [])))]
+                now_iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+                old = self._states.get(WEATHER_EID)
+                new = {"entity_id": WEATHER_EID, "state": state, "attributes": {"temperature": cur.get("temperature_2m"), "apparent_temperature": cur.get("apparent_temperature"), "humidity": cur.get("relative_humidity_2m"), "precipitation": cur.get("precipitation"), "rain": cur.get("rain"), "wind_speed": cur.get("wind_speed_10m"), "weather_code": cur.get("weather_code"), "is_day": cur.get("is_day"), "temperature_unit": "°C", "wind_speed_unit": "km/h", "precipitation_unit": "mm", "forecast": fc, "attribution": "Open-Meteo.com", "observed": cur.get("time")},
+                       "last_changed": now_iso if (not old or old.get("state") != state) else old.get("last_changed", now_iso), "last_updated": now_iso}
+                self._states[WEATHER_EID] = new
+                if self.exposed(WEATHER_EID): self.publish_state(WEATHER_EID, new)
+                if self.rules: self.eval_rules(WEATHER_EID, old, new)
+                log.info("Hava: %s %.1f°C yağış %.2f mm (Open-Meteo)", state, float(cur.get("temperature_2m") or 0), float(cur.get("precipitation") or 0))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("Hava alınamadı: %s", e)
+            await asyncio.sleep(900)
+
     async def on_ha_event(self, ev):
         if ev.get("event_type") != "state_changed": return
         d = ev.get("data", {}); eid = d.get("entity_id"); new = d.get("new_state"); old = d.get("old_state") or self._states.get(eid)
@@ -357,7 +406,8 @@ class Agent:
             try:                                                   # HA'nın saat dilimi → otomasyon saat koşulları
                 cfg = await self.ha.call({"type": "get_config"}); tzname = (cfg or {}).get("time_zone") or ""
                 self.tz = ZoneInfo(tzname) if (tzname and ZoneInfo) else None
-                log.info("Saat dilimi: %s", tzname or "sistem")
+                if (cfg or {}).get("latitude") is not None: self.lat = float(cfg["latitude"]); self.lon = float(cfg["longitude"])
+                log.info("Saat dilimi: %s · konum: %s", tzname or "sistem", ("%.3f,%.3f" % (self.lat, self.lon)) if self.lat is not None else "yok")
             except Exception as e:
                 log.warning("Saat dilimi alınamadı (%s); sistem saati kullanılacak", e)
             last_status = 0
@@ -373,6 +423,8 @@ class Agent:
                     except Exception: pass
                     raise SystemExit(4)
                 if kind == "connected":
+                    if self.lat is not None and self.weather_task is None:
+                        self.weather_task = asyncio.create_task(self.weather_loop(session)); await asyncio.sleep(2)   # ilk hava verisi registry/state'e yetişsin
                     self.publish_status(True); await self.sync_registry(); self.healthy = True
                 elif kind == "msg":
                     topic, payload = data

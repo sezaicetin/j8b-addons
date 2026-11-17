@@ -1,6 +1,6 @@
 # j8b — Home Assistant add-on. 0.3.0: slug/imaj adı da j8b (eski j8x kurulumu kaldırılıp yeniden kurulur, onarım koduyla aynı eve bağlanır) (ev tarafı ajan). Kaynak: j8b.net/agent/j8b_agent.py (scripts/addon_paketle.sh kopyalar)
 name: j8b
-version: "0.3.1"
+version: "0.4.0"
 slug: j8b
 description: "Evini tek yerden yönet. j8b bulutuna güvenli bağlantı — verin evde kalır."
 url: https://j8b.net/nasil-calisir

@@ -24,7 +24,7 @@ except Exception:  # pragma: no cover
 import aiohttp
 import paho.mqtt.client as mqtt
 
-AGENT_VERSION = "0.2.1"
+AGENT_VERSION = "0.3.1"
 log = logging.getLogger("j8b")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 

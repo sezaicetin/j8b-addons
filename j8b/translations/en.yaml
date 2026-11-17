@@ -1,0 +1,10 @@
+configuration:
+  pair_code:
+    name: Pairing code
+    description: The 8-character code you get from "Add home" in the j8b app (first setup only).
+  api_url:
+    name: API address
+    description: Leave as is — default https://api.j8b.net
+  log_level:
+    name: Log level
+    description: info is recommended.

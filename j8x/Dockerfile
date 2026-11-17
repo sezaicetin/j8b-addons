@@ -10,5 +10,5 @@ COPY j8b_agent.py /app/j8b_agent.py
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 # Supervisor'un hazir imajda aradigi etiketler
-LABEL io.hass.name="j8x" io.hass.description="j8x bulut ajani" io.hass.type="addon" io.hass.arch="${BUILD_ARCH}" io.hass.version="${BUILD_VERSION}" org.opencontainers.image.source="https://github.com/sezaicetin/j8x-addons"
+LABEL io.hass.name="j8b" io.hass.description="j8b bulut ajani" io.hass.type="addon" io.hass.arch="${BUILD_ARCH}" io.hass.version="${BUILD_VERSION}" org.opencontainers.image.source="https://github.com/sezaicetin/j8x-addons"
 CMD [ "/run.sh" ]

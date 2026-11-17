@@ -1,7 +1,7 @@
 configuration:
   pair_code:
     name: Eşleştirme kodu
-    description: j8x uygulamasında "Ev ekle" ile aldığın 8 haneli kod (yalnız ilk kurulumda).
+    description: j8b uygulamasında "Ev ekle" ile aldığın 8 haneli kod (yalnız ilk kurulumda).
   api_url:
     name: API adresi
     description: Değiştirme — varsayılan https://api.j8b.net

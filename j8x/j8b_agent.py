@@ -368,7 +368,7 @@ class Agent:
                     kind, data = None, None
                 if reader.done(): reader.result()
                 if kind == "revoked":
-                    log.error("Ev bulutta silinmiş ya da kimliği iptal edilmiş (%s). Eşleşme dosyası kaldırıldı; j8x uygulamasından yeni kod alıp Yapılandırma'ya yazın.", data)
+                    log.error("Ev bulutta silinmiş ya da kimliği iptal edilmiş (%s). Eşleşme dosyası kaldırıldı; j8b uygulamasından yeni kod alıp Yapılandırma'ya yazın.", data)
                     try: os.remove(STATE_FILE)
                     except Exception: pass
                     raise SystemExit(4)

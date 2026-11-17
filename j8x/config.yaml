@@ -1,8 +1,8 @@
-# j8x — Home Assistant add-on (ev tarafı ajan). Kaynak: j8b.net/agent/j8b_agent.py (scripts/addon_paketle.sh kopyalar)
-name: j8x
-version: "0.2.1"
+# j8b — Home Assistant add-on (slug/imaj adı 'j8x' tarihsel; görünen ad j8b) (ev tarafı ajan). Kaynak: j8b.net/agent/j8b_agent.py (scripts/addon_paketle.sh kopyalar)
+name: j8b
+version: "0.2.2"
 slug: j8x
-description: "Evini tek yerden yönet. j8x bulutuna güvenli bağlantı — verin evde kalır."
+description: "Evini tek yerden yönet. j8b bulutuna güvenli bağlantı — verin evde kalır."
 url: https://j8b.net/nasil-calisir
 image: "ghcr.io/sezaicetin/j8x-{arch}"
 arch: [aarch64, amd64]

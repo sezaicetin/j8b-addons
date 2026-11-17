@@ -1,4 +1,4 @@
-# j8x add-on — taban imaj burada (build.yaml Supervisor 2026.11 ile kullanımdan kalktı).
+# j8b add-on — taban imaj burada (build.yaml Supervisor 2026.11 ile kullanımdan kalktı).
 # Supervisor BUILD_ARCH'ı --build-arg ile verir; hazır imaj scripts/addon_imaj_yayinla.sh ile Mac'te derlenip registry'ye itilir.
 ARG BUILD_ARCH=aarch64
 FROM ghcr.io/home-assistant/${BUILD_ARCH}-base-python:3.12-alpine3.22
@@ -10,5 +10,5 @@ COPY j8b_agent.py /app/j8b_agent.py
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 # Supervisor'un hazir imajda aradigi etiketler
-LABEL io.hass.name="j8b" io.hass.description="j8b bulut ajani" io.hass.type="addon" io.hass.arch="${BUILD_ARCH}" io.hass.version="${BUILD_VERSION}" org.opencontainers.image.source="https://github.com/sezaicetin/j8x-addons"
+LABEL io.hass.name="j8b" io.hass.description="j8b bulut ajani" io.hass.type="addon" io.hass.arch="${BUILD_ARCH}" io.hass.version="${BUILD_VERSION}" org.opencontainers.image.source="https://github.com/sezaicetin/j8b-addons"
 CMD [ "/run.sh" ]

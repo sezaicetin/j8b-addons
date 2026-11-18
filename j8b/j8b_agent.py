@@ -11,13 +11,14 @@ Ortam:
   STATE_FILE    ./.home.json (uuid + mqtt kimliği)  — add-on'da /data/home.json
   INSTALL_TYPE  os | container | core | dev
 İlke: config gelmeden hiçbir state yayınlanmaz; yalnız expose listesindekiler çıkar; attributes'tan kayıt defterinde olanlar atılır.
+0.5.0: zaman ve güneş tetikleri (config.automations[].trigger.type = time|sun) — evde zamanlanır, internet gerekmez
 0.4.0: j8b.weather sanal cihazı — HA koordinatlarıyla Open-Meteo anlık hava (15 dk), kartta + otomasyon tetiğinde; bulut yükü yok
 0.2.1 (M8): eylem {notify:"metin"} → event/notify (bulut bildirime çevirir)
 0.2.0 (M7): config.automations[] → EVDE çalışan kural motoru (tetik: to|above|below + for_sec; koşul: saat/gün/durum; eylem: call_service);
             cmd {actions:[…]} → sahne (sırayla uygula, tek ack); event/automation → bulutta çalışma kaydı.
 """
 import asyncio, json, os, sys, time, signal, ssl, logging
-from datetime import datetime
+from datetime import datetime, timedelta
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
@@ -25,7 +26,7 @@ except Exception:  # pragma: no cover
 import aiohttp
 import paho.mqtt.client as mqtt
 
-AGENT_VERSION = "0.4.0"
+AGENT_VERSION = "0.5.0"
 log = logging.getLogger("j8b")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 
@@ -148,6 +149,7 @@ class Agent:
         self.expose = set(); self.expose_all = False; self.config_seen = False
         self.rules = []; self.rule_tasks = {}; self.rule_last = {}; self._states = {}; self.tz = None      # M7 kural motoru; tz = HA'nın saat dilimi
         self.lat = None; self.lon = None; self.weather_task = None                                       # 0.4.0 hava (Open-Meteo)
+        self.sun = {}; self.sched_fired = {}; self.sched_task = None                                       # 0.5.0 zaman/güneş tetikleri
         self.registry = {}; self.iot_cache = {}; self.ha = None; self.ha_version = ""
         self.loop = None; self.q = asyncio.Queue()
         m = st["mqtt"]
@@ -258,6 +260,10 @@ class Agent:
         self.rules = [r for r in (cfg.get("automations") or []) if isinstance(r, dict) and r.get("trigger") and r.get("actions")]
         for t in self.rule_tasks.values(): t.cancel()
         self.rule_tasks = {}
+        live = {r.get("id") for r in self.rules}
+        self.sched_fired = {k: v for k, v in self.sched_fired.items() if k in live}
+        if any((r.get("trigger") or {}).get("type") in ("time", "sun") for r in self.rules) and self.sched_task is None:
+            self.sched_task = asyncio.ensure_future(self.scheduler_loop())
         log.info("Config alındı: %d entity açık (expose_all=%s), %d otomasyon", len(self.expose), self.expose_all, len(self.rules))
         self.publish_all_exposed()
 
@@ -353,6 +359,7 @@ class Agent:
     def eval_rules(self, eid, old, new):
         for r in self.rules:
             t = r["trigger"]
+            if (t.get("type") or "entity") != "entity": continue
             if t.get("entity_id") != eid: continue
             if self.rule_fires(r, old, new):
                 if r.get("id") in self.rule_tasks: continue
@@ -363,12 +370,14 @@ class Agent:
     # --- 0.4.0 hava: Open-Meteo anlık + 3 günlük tahmin, 15 dk'da bir; HA state_changed gibi işlenir (kart, geçmiş, kurallar)
     async def weather_loop(self, session):
         url = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,rain,weather_code,wind_speed_10m,is_day"
-               "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=4&timezone=auto") % (self.lat, self.lon)
+               "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset&forecast_days=4&timezone=auto") % (self.lat, self.lon)
         while True:
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
                     d = await r.json()
                 cur = d.get("current") or {}; daily = d.get("daily") or {}
+                if daily.get("sunrise") and daily.get("sunset"):     # 0.5.0: günün (ve sonraki günlerin) doğuş/batış saatleri — güneş tetikleri için
+                    self.sun = {daily["time"][i]: (daily["sunrise"][i], daily["sunset"][i]) for i in range(len(daily["time"]))}
                 state = wmo_to_state(cur.get("weather_code"), cur.get("is_day", 1))
                 fc = [{"datetime": daily["time"][i], "condition": wmo_to_state(daily["weather_code"][i], 1), "temperature": daily["temperature_2m_max"][i], "templow": daily["temperature_2m_min"][i], "precipitation_probability": (daily.get("precipitation_probability_max") or [None]*9)[i]} for i in range(min(4, len(daily.get("time") or [])))]
                 now_iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
@@ -384,6 +393,53 @@ class Agent:
             except Exception as e:
                 log.warning("Hava alınamadı: %s", e)
             await asyncio.sleep(900)
+
+    # --- 0.5.0 zaman/güneş tetikleri: 20 sn'de bir kontrol; her kural günde bir kez (aynı hedef için) çalışır. Saat = evin saat dilimi.
+    def _sun_target(self, day_key, event, offset_min, now):
+        pair = self.sun.get(day_key)
+        if not pair:                                                  # Open-Meteo yoksa HA sun.sun'a düş
+            st = self._states.get("sun.sun")
+            if not st: return None
+            a = st.get("attributes", {}); iso = a.get("next_rising" if event == "sunrise" else "next_setting")
+            if not iso: return None
+            try: t = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(now.tzinfo)
+            except Exception: return None
+            return t + timedelta(minutes=offset_min)
+        iso = pair[0] if event == "sunrise" else pair[1]
+        try: t = datetime.fromisoformat(iso)
+        except Exception: return None
+        if t.tzinfo is None and now.tzinfo is not None: t = t.replace(tzinfo=now.tzinfo)
+        return t + timedelta(minutes=offset_min)
+
+    async def scheduler_loop(self):
+        while True:
+            try:
+                now = datetime.now(self.tz) if self.tz else datetime.now()
+                day_key = now.strftime("%Y-%m-%d")
+                for r in self.rules:
+                    t = r.get("trigger") or {}; typ = t.get("type") or ("entity" if t.get("entity_id") else "")
+                    if typ not in ("time", "sun"): continue
+                    rid = r.get("id")
+                    if typ == "time":
+                        target = None
+                        try:
+                            hh, mm = str(t.get("at", "")).split(":"); target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+                        except Exception: continue
+                        mark = day_key + "T" + t.get("at", "")
+                    else:
+                        target = self._sun_target(day_key, t.get("event", "sunset"), int(t.get("offset_min") or 0), now)
+                        if target is None: continue
+                        mark = target.strftime("%Y-%m-%dT%H:%M")
+                    delta = (now - target).total_seconds()
+                    if 0 <= delta < 90 and self.sched_fired.get(rid) != mark:
+                        self.sched_fired[rid] = mark
+                        asyncio.ensure_future(self.fire_rule(r, 0))
+                        log.info("zamanlı otomasyon tetiklendi: %s (%s)", r.get("name"), mark)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("zamanlayıcı hatası: %s", e)
+            await asyncio.sleep(20)
 
     async def on_ha_event(self, ev):
         if ev.get("event_type") != "state_changed": return
